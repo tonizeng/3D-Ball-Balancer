@@ -1,3 +1,5 @@
+# Used to demonstrate the ability to control the servos of the Stewart Platform
+
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
