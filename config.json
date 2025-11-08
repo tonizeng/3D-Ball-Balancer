@@ -1,0 +1,42 @@
+{
+  "timestamp": "2025-11-08T14:26:27.345307",
+  "beam_length_m": 0.3,
+  "camera": {
+    "index": 0,
+    "frame_width": 640,
+    "frame_height": 480
+  },
+  "ball_detection": {
+    "lower_hsv": [
+      6.0,
+      106.35,
+      190.0
+    ],
+    "upper_hsv": [
+      27.0,
+      198.65,
+      255.0
+    ]
+  },
+  "calibration": {
+    "pixel_to_meter_ratio": 0.0005671898429863195
+  },
+  "servo A": {
+    "port": "/dev/cu.usbmodem11101",
+    "neutral_angle": 60,
+    "position_min_m": null,
+    "position_max_m": null
+  },
+  "servo B": {
+    "port": "/dev/cu.usbmodem11101",
+    "neutral_angle": 80,
+    "position_min_m": null,
+    "position_max_m": null
+  },
+  "servo C": {
+    "port": "/dev/cu.usbmodem11101",
+    "neutral_angle": 20,
+    "position_min_m": null,
+    "position_max_m": null
+  }
+}
