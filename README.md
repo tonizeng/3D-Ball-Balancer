@@ -26,4 +26,4 @@ You should have started working on balancing the ball on the platform.
 - Arduino code that listens for commands and moves the platform motors accordingly.  
 - Keep the serial command format in sync with the new controller.
 
-notes: we should define a starting position / find a way to "zero" the system, so we have a consistent starting point.
+notes: we should finetune to make our starting position more flat
