@@ -26,4 +26,8 @@ You should have started working on balancing the ball on the platform.
 - Arduino code that listens for commands and moves the platform motors accordingly.  
 - Keep the serial command format in sync with the new controller.
 
-notes: we should finetune to make our starting position more flat
+notes/things to think about: 
+- we should finetune to make our starting position more flat
+- we will probably need script similar to `simple_cal.py` to fetch hsv bounds, frame size, and pixel-to-meter mapping, and store it in a `config.json` file. we will probably also need servo and geometry info for other scripts (probably similar to what was in the old cal file)
+- will we do live tuning? is the multi threading necessary or can we just hardcode it so we don't have to deal with the gui popping up?
+- where will the inverse kinematics equations be used? -> for now, since we only care about single-axis movement, this is not necessary yet.
