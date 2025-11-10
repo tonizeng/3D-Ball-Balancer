@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-11-08T14:26:27.345307",
+  "timestamp": "2025-11-10T10:19:59.575632",
   "beam_length_m": 0.3,
   "camera": {
     "index": 0,
@@ -8,18 +8,18 @@
   },
   "ball_detection": {
     "lower_hsv": [
-      6.0,
-      106.35,
-      190.0
+      8.0,
+      108.5,
+      212.0
     ],
     "upper_hsv": [
-      27.0,
-      198.65,
+      33.0,
+      251.5,
       255.0
     ]
   },
   "calibration": {
-    "pixel_to_meter_ratio": 0.0005671898429863195
+    "pixel_to_meter_ratio": 0.0008412210605289924
   },
   "servo A": {
     "port": "/dev/cu.usbmodem11101",

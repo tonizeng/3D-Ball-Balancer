@@ -48,11 +48,18 @@ class BasicPIDController:
 
         # Servo info
         self.servo_port = self.config['servo A']['port']
+        # self.servo_neutral_angles = [
+        #     self.config['servo A']['neutral_angle'],
+        #     self.config['servo B']['neutral_angle'],
+        #     self.config['servo C']['neutral_angle']
+        # ]
+
         self.servo_neutral_angles = [
-            self.config['servo A']['neutral_angle'],
-            self.config['servo B']['neutral_angle'],
-            self.config['servo C']['neutral_angle']
+          40,
+          40,
+          40
         ]
+        
         self.last_angles = self.servo_neutral_angles.copy()
         self.servo = None
 
