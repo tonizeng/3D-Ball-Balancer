@@ -1,22 +1,16 @@
 # Simple Auto Calibration System for Ball and Beam Control
-# Interactive calibration tool for color detection, geometry, and servo limits
+# Interactive calibration tool for color detection and geometry
 # Generates config.json file for use with ball tracking controller
 
 import cv2
 import numpy as np
 import json
 import math
-import serial
-import time
 from datetime import datetime
 from dataclasses import dataclass, field
 
 from typing import List, Optional
 
-# Need to define this globally to change data we are saving dynamically in the mouse callback.
-
-CURR_MOTOR = None
-TURN = 0
 
 
 @dataclass
@@ -24,11 +18,8 @@ class ServoConfig:
     """
     Maintain different calibration data for each axis/motor on the platform
     """
-    servo: Optional[object] = None  # Serial connection to servo
     servo_port: str = "/dev/cu.usbmodem11101"  # Servo communication port
     neutral_angle: List[float] = field(default_factory=lambda: [30, 0, 0])
-    position_min: Optional[float] = None  # Minimum ball position in meters
-    position_max: Optional[float] = None  # Maximum ball position in meters
     peg_points: List[int] = field(default_factory=list)  # Beam endpoint pixel coords
 
 
@@ -46,7 +37,7 @@ class SimpleAutoCalibrator:
         
         # Calibration state tracking
         self.current_frame = None  # Current video frame
-        self.phase = "color"  # Current phase: "color", "geometry", "limits", "complete"
+        self.phase = "color"  # Current phase: "color", "geometry", "complete"
         
         # Color calibration data
         self.hsv_samples = []  # Collected HSV color samples
@@ -55,50 +46,19 @@ class SimpleAutoCalibrator:
         
         # Geometry calibration data
         self.pixel_to_meter_ratio = None  # Conversion ratio from pixels to meters
+        self.platform_center = None  # Platform center point (centroid of 3 peg points)
+        self.peg_points_3d = []  # Three peg points (one per servo) for center calculation
         
         # Three motor config data class instances, one for each motor
         self.servo_A = ServoConfig(neutral_angle=[60, 0, 0])
         self.servo_B = ServoConfig(neutral_angle=[0, 80, 0])
         self.servo_C = ServoConfig(neutral_angle=[0, 0, 20]) # TODO: doenst fully go to neutral angle, investigate please!
-
-
-    def connect_servo(self):
-        """Establish serial connection to servo motor for automated limit finding.
         
-        Returns:
-            bool: True if connection successful, False otherwise
-        """
-        try:
-            self.servo_A.servo = serial.Serial(self.servo_A.servo_port, 9600)
-            time.sleep(2)  # Allow time for connection to stabilize
-            print("[SERVO A] Connected")
-            
-            self.servo_B.servo = serial.Serial(self.servo_B.servo_port, 9600)
-            time.sleep(2)  # Allow time for connection to stabilize
-            print("[SERVO B] Connected")
+        # Track which servo's peg point we're currently collecting
+        self.current_servo_index = 0  # 0=A, 1=B, 2=C
+        self.servos = [self.servo_A, self.servo_B, self.servo_C]
 
-            self.servo_C.servo = serial.Serial(self.servo_C.servo_port, 9600)
-            time.sleep(2)  # Allow time for connection to stabilize
-            print("[SERVO C] Connected")
-            return True
-        except:
-            print("[SERVO] Failed to connect - limits will be estimated")
-            return False
 
-    def send_servo_angle(self, angles, servo_obj):
-        """Send three servo angles over serial as 'a1 a2 a3\\n'."""
-        if not servo_obj:
-            return
-        # Clip each angle to a safe range (example 0..120)
-        clipped = [int(np.clip(a, 0, 120)) for a in angles]
-        cmd = f"{clipped[0]} {clipped[1]} {clipped[2]}\n"
-        try:
-            servo_obj.servo.write(cmd.encode("utf-8"))
-            # small pause to allow Arduino to process
-            time.sleep(0.05)
-            print("[SERVO] ->", cmd.strip())
-        except Exception as e:
-            print("[SERVO] Send failed:", e)
 
 
     def mouse_callback(self, event, x, y, flags, param):
@@ -110,21 +70,23 @@ class SimpleAutoCalibrator:
             flags: Additional event flags
             param: User data (unused)
         """
-        if not CURR_MOTOR:
-            return
-        
-        peg_points = CURR_MOTOR.peg_points
-
         if event == cv2.EVENT_LBUTTONDOWN:
             if self.phase == "color":
                 # Color sampling phase - collect HSV samples at click point
                 self.sample_color(x, y)
-            elif self.phase == "geometry" and len(peg_points) < 2:
-                # Geometry phase - collect beam endpoint coordinates
-                peg_points.append((x, y))
-                print(f"[GEO] Peg {len(peg_points)} selected")
-                if len(peg_points) == 2:
-                    self.calculate_geometry(CURR_MOTOR)
+            elif self.phase == "geometry":
+                # Geometry phase - collect one peg point per servo (3 points total)
+                if len(self.peg_points_3d) < 3:
+                    self.peg_points_3d.append((x, y))
+                    servo_names = ["A", "B", "C"]
+                    print(f"[GEO] Peg point {len(self.peg_points_3d)}/3 selected for Servo {servo_names[len(self.peg_points_3d)-1]}: ({x}, {y})")
+                    
+                    if len(self.peg_points_3d) == 3:
+                        # Calculate platform center as centroid of 3 peg points
+                        self.calculate_platform_center()
+                        # Geometry calibration complete
+                        self.phase = "complete"
+                        print("[GEO] All 3 peg points selected. Center calculated. Calibration complete! Press 's' to save.")
 
     def sample_color(self, x, y):
         """Sample HSV color values in a 5x5 region around click point.
@@ -171,19 +133,54 @@ class SimpleAutoCalibrator:
             
             print(f"[COLOR] Samples: {len(self.hsv_samples)}")
 
+    def calculate_platform_center(self):
+        """Calculate platform center as centroid of 3 peg points."""
+        if len(self.peg_points_3d) != 3:
+            print("[ERROR] Need exactly 3 peg points to calculate center")
+            return
+        
+        # Calculate centroid (average of 3 points)
+        center_x = sum(p[0] for p in self.peg_points_3d) / 3.0
+        center_y = sum(p[1] for p in self.peg_points_3d) / 3.0
+        self.platform_center = (center_x, center_y)
+        
+        print(f"[GEO] Platform center calculated: ({center_x:.1f}, {center_y:.1f})")
+        
+        # Calculate pixel-to-meter ratio using average distance between peg points
+        # Use the distance between the first two points as reference
+        if len(self.peg_points_3d) >= 2:
+            p1, p2 = self.peg_points_3d[0], self.peg_points_3d[1]
+            pixel_distance = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+            # Use a reasonable estimate - you may want to adjust this based on your setup
+            # For now, we'll estimate based on average spacing
+            if pixel_distance > 0:
+                # Estimate: if 3 points form a triangle, use average edge length
+                dists = []
+                for i in range(3):
+                    for j in range(i+1, 3):
+                        d = math.sqrt((self.peg_points_3d[j][0] - self.peg_points_3d[i][0])**2 + 
+                                     (self.peg_points_3d[j][1] - self.peg_points_3d[i][1])**2)
+                        dists.append(d)
+                avg_distance = sum(dists) / len(dists)
+                # Estimate scale: assume the 3 points span roughly the beam length
+                # This is an approximation - you may need to calibrate this separately
+                self.pixel_to_meter_ratio = self.BEAM_LENGTH_M / avg_distance if avg_distance > 0 else None
+                print(f"[GEO] Pixel-to-meter ratio (estimated): {self.pixel_to_meter_ratio:.6f}")
+    
     def calculate_geometry(self, servo_obj):
-        """Calculate pixel-to-meter conversion ratio from beam endpoint coordinates."""
-        p1, p2 = servo_obj.peg_points
+        """Calculate pixel-to-meter conversion ratio from beam endpoint coordinates.
+        Legacy method - kept for backward compatibility if needed."""
+        if len(servo_obj.peg_points) < 2:
+            return
+        p1, p2 = servo_obj.peg_points[0], servo_obj.peg_points[1]
         
         # Calculate pixel distance between beam endpoints
         pixel_distance = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
         
         # Convert to meters using known beam length
-        self.pixel_to_meter_ratio = self.BEAM_LENGTH_M / pixel_distance
-        print(f"[GEO] Pixel-to-meter ratio: {self.pixel_to_meter_ratio:.6f}")
-        
-        # Advance to limits calibration phase
-        self.phase = "limits"
+        if pixel_distance > 0:
+            self.pixel_to_meter_ratio = self.BEAM_LENGTH_M / pixel_distance
+            print(f"[GEO] Pixel-to-meter ratio: {self.pixel_to_meter_ratio:.6f}")
 
     def detect_ball_position(self, frame):
         """Detect ball in frame and return position in meters from center.
@@ -227,76 +224,6 @@ class SimpleAutoCalibrator:
         
         return meters_offset
 
-    def find_limits_automatically(self, servo_obj):
-        """Use servo motor to automatically find ball position limits."""
-        if not servo_obj:
-            # Estimate limits without servo if connection failed
-            global_position_min = -self.BEAM_LENGTH_M / 2
-            global_position_max = self.BEAM_LENGTH_M / 2
-            print("[LIMITS] Estimated without servo")
-            return
-        
-        print("[LIMITS] Finding limits with servo...")
-        positions = []
-        
-        # Test servo at different angles to find position range
-        #test_angles = [self.neutral_angle - 30, self.neutral_angle, self.neutral_angle + 20]
-        test_angles = [50, 30, 0]
-
-        print(f"[DEBUG] Test angles: {test_angles}")
-        
-        for i, angle in enumerate(test_angles):
-            
-            # Move servo to test angle. We construct an array of angles for the given motor i.e. place zeroes in the correct index to move the right motor.
-            angle_array_A = [angle,0,0]
-            angle_array_B = [0, angle,0]
-            angle_array_C = [0,0,angle]
-            global TURN
-            angle_array = angle_array_A
-            if TURN == 1:
-                angle_array = angle_array_B
-            elif TURN == 2:
-                angle_array = angle_array_C
-
-            print(f"[DEBUG] Starting test {i+1}/3: angle {angle} degrees (turn {TURN})")
-
-            self.send_servo_angle(angle_array, servo_obj)
-            time.sleep(2)  # Wait for ball to settle
-            
-            # Collect multiple position measurements
-            angle_positions = []
-            start_time = time.time()
-            while time.time() - start_time < 1.0:
-                ret, frame = self.cap.read()
-                if ret:
-                    pos = self.detect_ball_position(frame)
-                    if pos is not None:
-                        angle_positions.append(pos)
-                time.sleep(0.05)
-            
-            # Calculate average position for this angle
-            if angle_positions:
-                avg_pos = np.mean(angle_positions)
-                positions.append(avg_pos)
-                print(f"[LIMITS] Angle {angle}: {avg_pos:.4f}m ({len(angle_positions)} measurements)")
-            else:
-                print(f"[LIMITS] Angle {angle}: No ball detected!")
-            print(f"[DEBUG] Completed test {i+1}/3 for angle {angle}")
-
-        TURN += 1
-
-        print(f"[DEBUG] All tests completed. Collected {len(positions)} position measurements")
-
-        # Return servo to neutral position
-        self.send_servo_angle(servo_obj.neutral_angle, servo_obj)
-        
-        # Determine position limits from collected data
-        if len(positions) >= 2:
-            servo_obj.position_min = min(positions)
-            servo_obj.position_max = max(positions)
-            print(f"[LIMITS] Range: {servo_obj.position_min:.4f}m to {servo_obj.position_max:.4f}m")
-        else:
-            print("[LIMITS] Failed to find limits")
 
     def save_config(self):
         """Save all calibration results to config.json file."""
@@ -313,25 +240,24 @@ class SimpleAutoCalibrator:
                 "upper_hsv": [float(x) for x in self.upper_hsv] if self.upper_hsv else None
             },
             "calibration": {
-                "pixel_to_meter_ratio": float(self.pixel_to_meter_ratio) if self.pixel_to_meter_ratio else None
+                "pixel_to_meter_ratio": float(self.pixel_to_meter_ratio) if self.pixel_to_meter_ratio else None,
+                "platform_center": [float(self.platform_center[0]), float(self.platform_center[1])] if self.platform_center else None,
+                "peg_points_3d": [[float(p[0]), float(p[1])] for p in self.peg_points_3d] if self.peg_points_3d else None
             },
             "servo A": {
                 "port": str(self.servo_A.servo_port),
                 "neutral_angle": int(self.servo_A.neutral_angle[0]),
-                "position_min_m": float(self.servo_A.position_min) if self.servo_A.position_min else None,
-                "position_max_m": float(self.servo_A.position_max) if self.servo_A.position_max else None
+                "peg_points": [list(p) for p in self.servo_A.peg_points] if self.servo_A.peg_points else None
             },
             "servo B": {
                 "port": str(self.servo_B.servo_port),
                 "neutral_angle": int(self.servo_B.neutral_angle[1]),
-                "position_min_m": float(self.servo_B.position_min) if self.servo_B.position_min else None,
-                "position_max_m": float(self.servo_B.position_max) if self.servo_B.position_max else None
+                "peg_points": [list(p) for p in self.servo_B.peg_points] if self.servo_B.peg_points else None
             },
             "servo C": {
                 "port": str(self.servo_C.servo_port),
                 "neutral_angle": int(self.servo_C.neutral_angle[2]),
-                "position_min_m": float(self.servo_C.position_min) if self.servo_C.position_min else None,
-                "position_max_m": float(self.servo_C.position_max) if self.servo_C.position_max else None
+                "peg_points": [list(p) for p in self.servo_C.peg_points] if self.servo_C.peg_points else None
             }
         }
         
@@ -351,11 +277,14 @@ class SimpleAutoCalibrator:
         """
         overlay = frame.copy()
         
-        # Phase-specific instruction text
+        # Phase-specific instruction text (compute dynamically)
+        servo_names = ["A", "B", "C"]
+        num_selected = len(self.peg_points_3d)
+        
+        # Build phase text dictionary
         phase_text = {
             "color": "Click on ball to sample colors. Press 'c' when done.",
-            "geometry": "Click on beam endpoints (2 points)",
-            "limits": "Press 'l' to find limits automatically",
+            "geometry": f"Click peg point for Servo {servo_names[num_selected] if num_selected < 3 else 'Complete'} ({num_selected}/3)",
             "complete": "Calibration complete! Press 's' to save"
         }
         
@@ -370,33 +299,28 @@ class SimpleAutoCalibrator:
             cv2.putText(overlay, f"Color samples: {len(self.hsv_samples)}", (10, 90),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         
-        # Show geometry calibration points for each motor axis
+        # Show 3D peg points and platform center
+        servo_names = ["A", "B", "C"]
+        colors = [(0, 255, 0), (255, 255, 0), (0, 255, 255)]  # Green, Yellow, Cyan
         
-        for i, peg in enumerate(self.servo_A.peg_points):
-            cv2.circle(overlay, peg, 8, (0, 255, 0), -1)
-            cv2.putText(overlay, f"Peg {i+1}", (peg[0]+10, peg[1]-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-         # Draw line between beam endpoints if both are selected
-        if len(self.servo_A.peg_points) == 2:
-            cv2.line(overlay, self.servo_A.peg_points[0], self.servo_A.peg_points[1], (255, 0, 0), 2)
-            
-        for i, peg in enumerate(self.servo_B.peg_points):
-            cv2.circle(overlay, peg, 8, (0, 255, 0), -1)
-            cv2.putText(overlay, f"Peg {i+1}", (peg[0]+10, peg[1]-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
-        # Draw line between beam endpoints if both are selected
-        if len(self.servo_B.peg_points) == 2:
-            cv2.line(overlay, self.servo_B.peg_points[0], self.servo_B.peg_points[1], (255, 0, 0), 2)
+        for i, peg in enumerate(self.peg_points_3d):
+            cv2.circle(overlay, peg, 10, colors[i], -1)
+            cv2.putText(overlay, f"Servo {servo_names[i]}", (peg[0]+15, peg[1]-10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[i], 2)
         
-        for i, peg in enumerate(self.servo_C.peg_points):
-            cv2.circle(overlay, peg, 8, (0, 255, 0), -1)
-            cv2.putText(overlay, f"Peg {i+1}", (peg[0]+10, peg[1]-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
-        # Draw line between beam endpoints if both are selected
-        if len(self.servo_C.peg_points) == 2:
-            cv2.line(overlay, self.servo_C.peg_points[0], self.servo_C.peg_points[1], (255, 0, 0), 2)
+        # Draw triangle connecting the 3 peg points
+        if len(self.peg_points_3d) == 3:
+            cv2.line(overlay, self.peg_points_3d[0], self.peg_points_3d[1], (128, 128, 128), 1)
+            cv2.line(overlay, self.peg_points_3d[1], self.peg_points_3d[2], (128, 128, 128), 1)
+            cv2.line(overlay, self.peg_points_3d[2], self.peg_points_3d[0], (128, 128, 128), 1)
+        
+        # Draw platform center if calculated
+        if self.platform_center:
+            center = (int(self.platform_center[0]), int(self.platform_center[1]))
+            cv2.circle(overlay, center, 8, (255, 0, 255), -1)  # Magenta center
+            cv2.circle(overlay, center, 15, (255, 0, 255), 2)  # Magenta ring
+            cv2.putText(overlay, "CENTER", (center[0]+20, center[1]+5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         
         # Show real-time ball detection if color calibration is complete
         if self.lower_hsv:
@@ -427,22 +351,6 @@ class SimpleAutoCalibrator:
                                        (int(x)+20, int(y)+20),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
-        # Show final results if limit calibration is complete
-        if self.servo_A.position_min is not None and self.servo_A.position_max is not None:
-            cv2.putText(overlay, f"Limits: {self.servo_A.position_min:.4f}m to {self.servo_A.position_max:.4f}m",
-                       (10, overlay.shape[0] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-        if self.servo_B.position_min is not None and self.servo_B.position_max is not None:
-            cv2.putText(overlay, f"Limits: {self.servo_A.position_min:.4f}m to {self.servo_B.position_max:.4f}m",
-                       (10, overlay.shape[0] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            
-        if self.servo_C.position_min is not None and self.servo_C.position_max is not None:
-            cv2.putText(overlay, f"Limits: {self.servo_A.position_min:.4f}m to {self.servo_C.position_max:.4f}m",
-                       (10, overlay.shape[0] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        
         return overlay
 
     def run(self):
@@ -457,15 +365,11 @@ class SimpleAutoCalibrator:
         cv2.namedWindow("Auto Calibration")
         cv2.setMouseCallback("Auto Calibration", self.mouse_callback)
         
-        # Attempt servo connection
-        self.connect_servo()
-        
         # Display instructions
         print("[INFO] Simple Auto Calibration")
         print("Phase 1: Click on ball to sample colors, press 'c' when done")
-        print("Phase 2: Click on beam endpoints")
-        print("Phase 3: Press 'l' to find limits")
-        print("Press 's' to save, 'q' to quit")
+        print("Phase 2: Click on 3 peg points (one for each servo A, B, C)")
+        print("Press 's' to save when complete, 'q' to quit")
         
         # Main calibration loop
         while True:
@@ -489,17 +393,8 @@ class SimpleAutoCalibrator:
                 # Complete color calibration phase
                 if self.hsv_samples:
                     self.phase = "geometry"
-                    print("[INFO] Color calibration complete. Click on beam endpoints.")
-            elif key == ord('l') and self.phase == "limits":
-                # Start automatic limit finding for each motor
-                CURR_MOTOR = calibrator.servo_A
-                self.find_limits_automatically(self.servo_A)
-                CURR_MOTOR = calibrator.servo_B
-                self.find_limits_automatically(self.servo_B)
-                CURR_MOTOR = calibrator.servo_C
-                self.find_limits_automatically(self.servo_C)
-
-                self.phase = "complete"
+                    print("[INFO] Color calibration complete. Click on 3 peg points (one for each servo A, B, C).")
+                    print("[INFO] These points define the platform geometry. The center will be the centroid of these 3 points.")
             elif key == ord('s') and self.phase == "complete":
                 # Save configuration and exit
                 self.save_config()
@@ -508,15 +403,8 @@ class SimpleAutoCalibrator:
         # Clean up resources
         self.cap.release()
         cv2.destroyAllWindows()
-        if self.servo_A:
-            self.servo_A.servo.close()
-        if self.servo_B:
-            self.servo_B.servo.close()
-        if self.servo_C:
-            self.servo_C.servo.close()
 
 if __name__ == "__main__":
     """Run calibration when script is executed directly."""
     calibrator = SimpleAutoCalibrator()
-    CURR_MOTOR = calibrator.servo_A
     calibrator.run()
