@@ -131,6 +131,7 @@ class BasicPIDController:
             output + self.servo_neutral_angles[active_motor], 0, 120))
         
         cmd = f"{self.last_angles[0]} {self.last_angles[1]} {self.last_angles[2]}\n"
+        print(cmd)
         try:
             self.servo.write(cmd.encode())
         except Exception as e:
@@ -153,6 +154,7 @@ class BasicPIDController:
         D = kd * derivative
         self.prev_error = error
         output = np.clip(P + I + D, -360, 360)
+        print(f"[PID] Error: {error:.3f}, P: {P:.1f}, I: {I:.1f}, D: {D:.1f}, Output: {output:.1f}")
         return output
 
     def calculate_motor_position(self, ball_x_norm, center_x, center_y, frame_width, frame_height, active_motor):
@@ -182,13 +184,10 @@ class BasicPIDController:
         # If we have peg points, project onto the active motor's axis
         if self.peg_points_3d and len(self.peg_points_3d) == 3:
             # Get the active motor's peg point
+            # Frame is resized to calibration size, so no scaling needed
             peg_point = self.peg_points_3d[active_motor]
-            
-            # Scale peg point to match current frame size
-            scale_x = frame_width / self.config['camera']['frame_width']
-            scale_y = frame_height / self.config['camera']['frame_height']
-            peg_x = peg_point[0] * scale_x
-            peg_y = peg_point[1] * scale_y
+            peg_x = peg_point[0]
+            peg_y = peg_point[1]
             
             # Calculate direction vector from center to peg point
             dir_x = peg_x - center_x
@@ -217,20 +216,36 @@ class BasicPIDController:
     # --- Camera Thread ---
     def camera_thread(self):
         cap = cv2.VideoCapture(self.config['camera']['index'])
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config['camera']['frame_width'])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config['camera']['frame_height'])
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Verify actual captured frame size (camera may not honor requested resolution)
+        ret, test_frame = cap.read()
+        if ret:
+            actual_w, actual_h = test_frame.shape[1], test_frame.shape[0]
+            requested_w = self.config['camera']['frame_width']
+            requested_h = self.config['camera']['frame_height']
+            if actual_w != requested_w or actual_h != requested_h:
+                print(f"[CAMERA] Requested {requested_w}x{requested_h}, but camera captured {actual_w}x{actual_h}")
+                print(f"[CAMERA] Resizing to {requested_w}x{requested_h} to match calibration dimensions")
+        
         while self.running:
             ret, frame = cap.read()
             if not ret:
                 continue
-            frame = cv2.resize(frame, (320, 240))
+            
+            # Resize frame to match calibration dimensions to ensure peg points align correctly
+            # The camera may not capture at exactly the requested resolution, so we force it
+            frame = cv2.resize(frame, (self.config['camera']['frame_width'], 
+                                       self.config['camera']['frame_height']))
+            
             found, x_norm, vis_frame = detect_ball_x(frame, self.lower_hsv, self.upper_hsv)
             
             # Use platform center from calibration (centroid of 3 peg points)
-            # Scale center coordinates to match resized frame
-            scale_x = frame.shape[1] / self.config['camera']['frame_width']
-            scale_y = frame.shape[0] / self.config['camera']['frame_height']
-            mid_x = self.platform_center[0] * scale_x
-            mid_y = self.platform_center[1] * scale_y
+            # Frame is now exactly the calibration size, so no scaling needed
+            mid_x = self.platform_center[0]
+            mid_y = self.platform_center[1]
             
             if found:
                 # Get active motor (thread-safe)
@@ -253,24 +268,24 @@ class BasicPIDController:
             cv2.circle(vis_frame, center_pixel, 5, (255, 0, 255), -1)  # Magenta dot
             cv2.circle(vis_frame, center_pixel, 10, (255, 0, 255), 1)  # Magenta ring
             
-            # Draw 3D peg points if available
+            # Draw 3D peg points if available (frame is now calibration size, no scaling needed)
             if self.peg_points_3d:
                 servo_names = ["A", "B", "C"]
                 colors = [(0, 255, 0), (255, 255, 0), (0, 255, 255)]  # Green, Yellow, Cyan
                 for i, peg in enumerate(self.peg_points_3d):
-                    peg_scaled = (int(peg[0] * scale_x), int(peg[1] * scale_y))
-                    cv2.circle(vis_frame, peg_scaled, 3, colors[i], -1)
+                    peg_point = (int(peg[0]), int(peg[1]))
+                    cv2.circle(vis_frame, peg_point, 3, colors[i], -1)
                 # Draw triangle connecting peg points
                 if len(self.peg_points_3d) == 3:
-                    pts = [(int(p[0] * scale_x), int(p[1] * scale_y)) for p in self.peg_points_3d]
+                    pts = [(int(p[0]), int(p[1])) for p in self.peg_points_3d]
                     cv2.line(vis_frame, pts[0], pts[1], (128, 128, 128), 1)
                     cv2.line(vis_frame, pts[1], pts[2], (128, 128, 128), 1)
                     cv2.line(vis_frame, pts[2], pts[0], (128, 128, 128), 1)
             
             # Legacy: draw lineA if it exists (for backward compatibility)
             if self.lineA and len(self.lineA) == 2:
-                lineA_scaled = [(int(p[0] * scale_x), int(p[1] * scale_y)) for p in self.lineA]
-                cv2.line(vis_frame, lineA_scaled[0], lineA_scaled[1], (255, 0, 0), 1)
+                lineA_points = [(int(p[0]), int(p[1])) for p in self.lineA]
+                cv2.line(vis_frame, lineA_points[0], lineA_points[1], (255, 0, 0), 1)
             
             # Draw target setpoint marker
             with self.pid_lock:
@@ -283,12 +298,10 @@ class BasicPIDController:
                 
                 # Project target onto the active motor's axis (same as ball position)
                 if self.peg_points_3d and len(self.peg_points_3d) == 3:
-                    # Get the active motor's peg point
+                    # Get the active motor's peg point (frame is calibration size, no scaling needed)
                     peg_point = self.peg_points_3d[active_motor]
-                    scale_x = frame.shape[1] / self.config['camera']['frame_width']
-                    scale_y = frame.shape[0] / self.config['camera']['frame_height']
-                    peg_x = peg_point[0] * scale_x
-                    peg_y = peg_point[1] * scale_y
+                    peg_x = peg_point[0]
+                    peg_y = peg_point[1]
                     
                     # Calculate direction vector from center to peg point
                     dir_x = peg_x - mid_x

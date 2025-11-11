@@ -33,7 +33,7 @@ class SimpleAutoCalibrator:
         
         # Camera configuration
         self.CAM_INDEX = 0  # Default camera index
-        self.FRAME_W, self.FRAME_H = 640, 480  # Frame dimensions
+        self.FRAME_W, self.FRAME_H = 800, 600  # Frame dimensions
         
         # Calibration state tracking
         self.current_frame = None  # Current video frame
@@ -50,16 +50,13 @@ class SimpleAutoCalibrator:
         self.peg_points_3d = []  # Three peg points (one per servo) for center calculation
         
         # Three motor config data class instances, one for each motor
-        self.servo_A = ServoConfig(neutral_angle=[60, 0, 0])
-        self.servo_B = ServoConfig(neutral_angle=[0, 80, 0])
-        self.servo_C = ServoConfig(neutral_angle=[0, 0, 20]) # TODO: doenst fully go to neutral angle, investigate please!
+        self.servo_A = ServoConfig(neutral_angle=[40, 40, 40])
+        self.servo_B = ServoConfig(neutral_angle=[40, 40, 40])
+        self.servo_C = ServoConfig(neutral_angle=[40, 40, 40]) # TODO: doenst fully go to neutral angle, investigate please!
         
         # Track which servo's peg point we're currently collecting
         self.current_servo_index = 0  # 0=A, 1=B, 2=C
         self.servos = [self.servo_A, self.servo_B, self.servo_C]
-
-
-
 
     def mouse_callback(self, event, x, y, flags, param):
         """Handle mouse click events for interactive calibration.
