@@ -39,9 +39,9 @@ class BasicPIDController:
             self.config = json.load(f)
 
         # PID gains
-        self.Kp = 10.0
-        self.Ki = 0.0
-        self.Kd = 0.0
+        self.Kp = 1.1
+        self.Ki = 0.9
+        self.Kd = 1.1
 
         # Scale factor
         self.scale_factor = self.config['calibration']['pixel_to_meter_ratio'] * self.config['camera']['frame_width']
@@ -126,9 +126,8 @@ class BasicPIDController:
         # Reset all angles to neutral
         self.last_angles = self.servo_neutral_angles.copy()
         
-        # Apply control output only to the active motor
-        self.last_angles[active_motor] = int(np.clip(
-            output + self.servo_neutral_angles[active_motor], 0, 120))
+        # Apply control output only to the active motor (output is already absolute angle 0-120)
+        self.last_angles[active_motor] = int(np.clip(output, 0, 120))
         
         cmd = f"{self.last_angles[0]} {self.last_angles[1]} {self.last_angles[2]}\n"
         print(cmd)
@@ -146,15 +145,62 @@ class BasicPIDController:
             setpoint = self.setpoint
 
         error = position - setpoint
-        error *= 100  # scale
+        # error *= 100  # scale
         P = kp * error
         self.integral += error * dt
         I = ki * self.integral
         derivative = (error - self.prev_error) / dt
         D = kd * derivative
         self.prev_error = error
-        output = np.clip(P + I + D, -360, 360)
-        print(f"[PID] Error: {error:.3f}, P: {P:.1f}, I: {I:.1f}, D: {D:.1f}, Output: {output:.1f}")
+        
+        # Calculate raw PID output
+        pid_output = P + I + D
+        
+        # Get active motor to use motor-specific thresholds
+        with self.pid_lock:
+            active_motor = self.active_motor
+        
+        # Per-motor sensitivity scaling factors (to compensate for different motor sensitivities)
+        # Values < 1.0 reduce sensitivity, > 1.0 increase sensitivity
+        # Motor B is more sensitive, so scale it down
+        motor_sensitivity_scales = [1.0, 1.0, 1.0]  # [Motor A, Motor B, Motor C]
+        sensitivity_scale = motor_sensitivity_scales[active_motor]
+        
+        # Scale PID output based on motor sensitivity
+        pid_output = pid_output * sensitivity_scale
+        
+        # Center output around motor's neutral angle (40 degrees)
+        # This gives us -40 to +80 range from neutral, which maps to 0-120 servo range
+        center_angle = 40.0  # Motor's physical neutral position
+        output = center_angle + pid_output
+        
+        # Apply minimum output threshold to overcome friction/inertia near center
+        # When error is small, PID output is tiny and motor may not move
+        # This ensures minimum movement to overcome static friction
+        # Per-motor thresholds (can be adjusted individually if needed)
+        min_output_thresholds = [5, 0, 5]  # [Motor A, Motor B, Motor C] - Minimum degrees to move from center
+        min_output_threshold = min_output_thresholds[active_motor]
+        
+        # Extra threshold for the side that needs more support (away from motor)
+        # direction = 1: error >= 0 (one side), direction = -1: error < 0 (other side)
+        # Negative error side (direction == -1) struggles more, so needs extra threshold
+        # Per-motor extra thresholds (can be adjusted individually if needed)
+        extra_thresholds_negative_error_side = [10, 10, 10]  # [Motor A, Motor B, Motor C] - Extra degrees for negative error side
+        extra_threshold_negative_error_side = extra_thresholds_negative_error_side[active_motor]
+        if abs(pid_output) < min_output_threshold and abs(error) > 0.0005:
+            # Apply minimum movement in direction of error
+            direction = 1 if pid_output >= 0 else -1
+            if direction == 1:
+                # Ball on positive error side (normal threshold)
+                output = center_angle + min_output_threshold 
+            else:
+                # Ball on negative error side - add extra support since this side struggles more
+                output = center_angle - min_output_threshold - extra_threshold_negative_error_side
+        
+        # Clip to valid servo range (0-120 degrees)
+        output = np.clip(output, 0, 120)
+        print("P: ", P, "kp: ", kp, "Error: ", error, "PID_out: ", pid_output, "Output: ", output)
+        # print(f"[PID] Error: {error:.3f}, P: {P:.1f}, I: {I:.1f}, D: {D:.1f}, Output: {output:.1f}")
         return output
 
     def calculate_motor_position(self, ball_x_norm, center_x, center_y, frame_width, frame_height, active_motor):

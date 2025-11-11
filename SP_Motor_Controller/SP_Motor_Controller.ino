@@ -1,4 +1,3 @@
-
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
@@ -14,8 +13,12 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 
 // Servo channels
 #define SERVO1 0
-#define SERVO2 1
-#define SERVO3 2
+#define SERVO2 7
+#define SERVO3 11
+
+int prevAngle1 = 0;
+int prevAngle2 = 0;
+int prevAngle3 = 0;
 
 int angleToPulse(int angle) 
 {
@@ -33,15 +36,22 @@ void moveMotors(int angle1, int angle2, int angle3)
       angle1 = constrain(angle1, 60, 180);
       angle2 = constrain(angle2, 80, 200);
       angle3 = constrain(angle3, 20, 140);
-  
-      // Convert to pulse width and set servos
-      pwm.setPWM(SERVO1, 0, angleToPulse(angle1));
-      pwm.setPWM(SERVO2, 0, angleToPulse(angle2));
-      pwm.setPWM(SERVO3, 0, angleToPulse(angle3));
-  
-      Serial.print("Servo 1: "); Serial.print(angle1-60);
-      Serial.print(" | Servo 2: "); Serial.print(angle2-80);
-      Serial.print(" | Servo 3: "); Serial.println(angle3-20); 
+
+      if(prevAngle1 != angle1)
+      {
+        pwm.setPWM(SERVO1, 0, angleToPulse(angle1));
+        prevAngle1 = angle1;
+      }
+      if(prevAngle2 != angle2)
+      {
+        pwm.setPWM(SERVO2, 0, angleToPulse(angle2));
+        prevAngle2 = angle2;
+      }
+      if(prevAngle3 != angle3)
+      {
+        pwm.setPWM(SERVO3, 0, angleToPulse(angle3));
+        prevAngle3 = angle3;
+      }
 }
 
 void setup() 
@@ -107,7 +117,6 @@ void loop()
     }
     else 
     {
-      // Use the regular 3 input angles
       moveMotors(angle1, angle2, angle3);
     }
   }
