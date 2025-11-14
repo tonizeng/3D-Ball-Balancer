@@ -41,7 +41,7 @@ class BasicPIDController:
 
         # PID gains
         self.Kp = 0.099
-        self.Ki = 0.030
+        self.Ki = 0.040
         self.Kd = 0.200
 
         # Scale factor
@@ -254,82 +254,37 @@ class BasicPIDController:
                 lineA_points = [(int(p[0]), int(p[1])) for p in self.lineA]
                 cv2.line(vis_frame, lineA_points[0], lineA_points[1], (255, 0, 0), 1)
             
-            # Draw target setpoint marker
+            # Draw target setpoint marker (always at 2D setpoint position)
             with self.pid_lock:
                 setpoint = self.setpoint
-                active_motor = self.active_motor
-            if self.scale_factor != 0:
-                # Project setpoint vector onto the active motor's axis
-                if isinstance(setpoint, list):
-                    if self.peg_points_3d and len(self.peg_points_3d) == 3:
-                        peg_point = self.peg_points_3d[active_motor]
-                        peg_x = peg_point[0]
-                        peg_y = peg_point[1]
-                        dir_x = peg_x - mid_x
-                        dir_y = peg_y - mid_y
-                        dir_length = np.sqrt(dir_x**2 + dir_y**2)
-                        if dir_length > 0:
-                            dir_x /= dir_length
-                            dir_y /= dir_length
-                            setpoint_proj = setpoint[0] * dir_x + setpoint[1] * dir_y
-                        else:
-                            setpoint_proj = setpoint[0]
-                    else:
-                        setpoint_proj = setpoint[0]
-                else:
-                    setpoint_proj = setpoint
-                target_offset_meters = setpoint_proj
-                target_offset_pixels = target_offset_meters / self.scale_factor
-                
-                # Project target onto the active motor's axis (same as ball position)
-                if self.peg_points_3d and len(self.peg_points_3d) == 3:
-                    # Get the active motor's peg point (frame is calibration size, no scaling needed)
-                    peg_point = self.peg_points_3d[active_motor]
-                    peg_x = peg_point[0]
-                    peg_y = peg_point[1]
-                    
-                    # Calculate direction vector from center to peg point
-                    dir_x = peg_x - mid_x
-                    dir_y = peg_y - mid_y
-                    dir_length = np.sqrt(dir_x**2 + dir_y**2)
-                    
-                    if dir_length > 0:
-                        # Normalize direction vector
-                        dir_x /= dir_length
-                        dir_y /= dir_length
-                        
-                        # Position target along this direction
-                        target_x = int(mid_x + target_offset_pixels * dir_x)
-                        target_y = int(mid_y + target_offset_pixels * dir_y)
-                    else:
-                        # Fallback: use x-axis
-                        target_x = int(mid_x + target_offset_pixels)
-                        target_y = int(mid_y)
-                else:
-                    # Fallback: use x-axis
-                    target_x = int(mid_x + target_offset_pixels)
-                    target_y = int(mid_y)
-                
-                # Ensure target is within frame bounds
-                target_x = np.clip(target_x, 0, frame.shape[1] - 1)
-                target_y = np.clip(target_y, 0, frame.shape[0] - 1)
-                
-                # Draw a cross marker at target position
+            if isinstance(setpoint, list) and len(setpoint) == 2:
+                # Convert setpoint (meters) to pixel coordinates relative to platform center
+                # The setpoint is in meters, so convert to pixels using scale_factor
+                setpoint_x_m, setpoint_y_m = setpoint
+                # Platform center in pixels
+                center_x, center_y = mid_x, mid_y
+                # Setpoint in pixels
+                setpoint_x_pix = int(center_x + setpoint_x_m / self.scale_factor)
+                setpoint_y_pix = int(center_y + setpoint_y_m / self.scale_factor)
+                # Ensure within frame bounds
+                setpoint_x_pix = np.clip(setpoint_x_pix, 0, frame.shape[1] - 1)
+                setpoint_y_pix = np.clip(setpoint_y_pix, 0, frame.shape[0] - 1)
+                # Draw a red cross marker at setpoint position
                 marker_size = 15
                 cv2.line(vis_frame, 
-                        (target_x - marker_size, target_y), 
-                        (target_x + marker_size, target_y), 
-                        (0, 255, 255), 3)  # Yellow horizontal line
+                         (setpoint_x_pix - marker_size, setpoint_y_pix), 
+                         (setpoint_x_pix + marker_size, setpoint_y_pix), 
+                         (0, 0, 255), 3)  # Red horizontal line
                 cv2.line(vis_frame, 
-                        (target_x, target_y - marker_size), 
-                        (target_x, target_y + marker_size), 
-                        (0, 255, 255), 3)  # Yellow vertical line
-                # Draw a circle around the target
-                cv2.circle(vis_frame, (target_x, target_y), marker_size + 5, (0, 255, 255), 2)
-                # Label the target with setpoint value
-                cv2.putText(vis_frame, f"Target: x={setpoint[0]:.3f}, y={setpoint[1]:.3f}m", 
-                           (target_x + marker_size + 5, target_y - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                         (setpoint_x_pix, setpoint_y_pix - marker_size), 
+                         (setpoint_x_pix, setpoint_y_pix + marker_size), 
+                         (0, 0, 255), 3)  # Red vertical line
+                # Draw a red circle around the setpoint
+                cv2.circle(vis_frame, (setpoint_x_pix, setpoint_y_pix), marker_size + 5, (0, 0, 255), 2)
+                # Label the setpoint
+                cv2.putText(vis_frame, f"Setpoint: x={setpoint_x_m:.3f}, y={setpoint_y_m:.3f}m", 
+                            (setpoint_x_pix + marker_size + 5, setpoint_y_pix - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
             
             try:
                 if self.display_queue.full():
@@ -411,21 +366,21 @@ class BasicPIDController:
 
         # Setpoint sliders for X and Y
         ttk.Label(self.root, text="Setpoint X (m)").pack()
-        beam_length = self.config.get('beam_length_m', 0.30)
-        servo_a_config = self.config.get('servo A', {})
-        pos_min = servo_a_config.get('position_min_m')
-        pos_max = servo_a_config.get('position_max_m')
-        if pos_min is None:
-            pos_min = -beam_length / 2
-        if pos_max is None:
-            pos_max = beam_length / 2
+        frame_width = self.config['camera']['frame_width']
+        frame_height = self.config['camera']['frame_height']
+        scale = self.scale_factor
+        # Allow setpoint to cover the entire camera feed
+        x_range = (frame_width / 2) / scale
+        y_range = (frame_height / 2) / scale
         self.setpoint_x_var = tk.DoubleVar(value=self.setpoint[0])
-        spx_slider = ttk.Scale(self.root, from_=pos_min, to=pos_max, variable=self.setpoint_x_var, orient=tk.HORIZONTAL, length=500)
+        spx_slider = ttk.Scale(self.root, from_=-x_range, to=x_range, variable=self.setpoint_x_var, orient=tk.HORIZONTAL, length=500)
         spx_slider.pack()
+        spx_slider.config(takefocus=1)
         ttk.Label(self.root, text="Setpoint Y (m)").pack()
         self.setpoint_y_var = tk.DoubleVar(value=self.setpoint[1])
-        spy_slider = ttk.Scale(self.root, from_=pos_min, to=pos_max, variable=self.setpoint_y_var, orient=tk.HORIZONTAL, length=500)
+        spy_slider = ttk.Scale(self.root, from_=-y_range, to=y_range, variable=self.setpoint_y_var, orient=tk.HORIZONTAL, length=500)
         spy_slider.pack()
+        spy_slider.config(takefocus=1)
         self.setpoint_label = ttk.Label(self.root, text=f"Setpoint: x={self.setpoint[0]:.3f}, y={self.setpoint[1]:.3f}")
         self.setpoint_label.pack()
 
