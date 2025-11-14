@@ -56,7 +56,7 @@ void moveMotors(int angle1, int angle2, int angle3)
 
 void setup() 
 {
-  Serial.begin(9600);  
+  Serial.begin(115200);  
   pwm.begin();
   pwm.setPWMFreq(50);   // Servos use ~50 Hz refresh rate
   moveMotors(0, 0, 0);  // Move to default position

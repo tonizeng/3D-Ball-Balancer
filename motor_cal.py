@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 import json
 import math
+import serial
+import time
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -52,8 +54,11 @@ class SimpleAutoCalibrator:
         # Three motor config data class instances, one for each motor
         self.servo_A = ServoConfig(neutral_angle=[40, 40, 40])
         self.servo_B = ServoConfig(neutral_angle=[40, 40, 40])
-        self.servo_C = ServoConfig(neutral_angle=[40, 40, 40]) # TODO: doenst fully go to neutral angle, investigate please!
-        
+        self.servo_C = ServoConfig(neutral_angle=[40, 40, 40])
+
+        self.servo_serial = serial.Serial(self.servo_A.servo_port, 115200)
+        time.sleep(2)
+       
         # Track which servo's peg point we're currently collecting
         self.current_servo_index = 0  # 0=A, 1=B, 2=C
         self.servos = [self.servo_A, self.servo_B, self.servo_C]
@@ -352,6 +357,11 @@ class SimpleAutoCalibrator:
 
     def run(self):
         """Main calibration loop with interactive GUI."""
+
+        # Set the motors to their neutral angles
+        cmd = f"{40} {40} {40}\n"  # Neutral angle command
+        self.servo_serial.write(cmd.encode())
+
         # Initialize camera capture
         self.cap = cv2.VideoCapture(self.CAM_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.FRAME_W)

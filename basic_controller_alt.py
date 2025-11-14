@@ -10,8 +10,8 @@ from threading import Thread, Lock
 import queue
 
 # --- Ball detection using calibration ---
-def detect_ball_x(frame, lower_hsv, upper_hsv):
-    """Detect ball in frame and return normalized x-position and visualization frame."""
+def detect_ball_xy(frame, lower_hsv, upper_hsv):
+    """Detect ball in frame and return normalized (x, y) position and visualization frame."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower = np.array(lower_hsv, dtype=np.uint8)
     upper = np.array(upper_hsv, dtype=np.uint8)
@@ -20,16 +20,17 @@ def detect_ball_x(frame, lower_hsv, upper_hsv):
     mask = cv2.dilate(mask, None, iterations=2)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return False, None, frame
+        return False, None, None, frame
     largest = max(contours, key=cv2.contourArea)
     ((x, y), radius) = cv2.minEnclosingCircle(largest)
     vis_frame = frame.copy()
     if radius > 5:
         cv2.circle(vis_frame, (int(x), int(y)), int(radius), (0, 0, 255), 2)
         cv2.circle(vis_frame, (int(x), int(y)), 3, (0, 0, 255), -1)
-        normalized_x = x / frame.shape[1]  # 0-1
-        return True, normalized_x, vis_frame
-    return False, None, vis_frame
+        normalized_x = x / frame.shape[1]
+        normalized_y = y / frame.shape[0]
+        return True, normalized_x, normalized_y, vis_frame
+    return False, None, None, vis_frame
 
 # --- PID Controller ---
 class BasicPIDController:
@@ -39,37 +40,26 @@ class BasicPIDController:
             self.config = json.load(f)
 
         # PID gains
-        self.Kp = 1.1
-        self.Ki = 0.9
-        self.Kd = 1.1
+        self.Kp = 0.099
+        self.Ki = 0.030
+        self.Kd = 0.200
 
         # Scale factor
         self.scale_factor = self.config['calibration']['pixel_to_meter_ratio'] * self.config['camera']['frame_width']
 
         # Servo info
         self.servo_port = self.config['servo A']['port']
-        # self.servo_neutral_angles = [
-        #     self.config['servo A']['neutral_angle'],
-        #     self.config['servo B']['neutral_angle'],
-        #     self.config['servo C']['neutral_angle']
-        # ]
-
-        self.servo_neutral_angles = [
-          40,
-          40,
-          40
-        ]
-        
+        self.servo_neutral_angles = [40, 40, 40]
         self.last_angles = self.servo_neutral_angles.copy()
         self.servo = None
         
         # Active motor selection (0=A, 1=B, 2=C)
         self.active_motor = 0  # Default to motor A
 
-        # Ball tracking
-        self.setpoint = 0.0
-        self.integral = 0.0
-        self.prev_error = 0.0
+        # Ball tracking (now 2D)
+        self.setpoint = [0.0, 0.0]  # [setpoint_x, setpoint_y]
+        self.integral = [0.0, 0.0, 0.0]
+        self.prev_error = [0.0, 0.0, 0.0]
 
         # Logs
         self.time_log = []
@@ -95,6 +85,7 @@ class BasicPIDController:
         if platform_center:
             self.platform_center = (platform_center[0], platform_center[1])
         else:
+            print("Warning: Using frame center as platform center")
             # Fallback: use frame center if no platform center is defined
             self.platform_center = (self.config['camera']['frame_width'] / 2, 
                                    self.config['camera']['frame_height'] / 2)
@@ -109,7 +100,7 @@ class BasicPIDController:
     # --- Servo Communication ---
     def connect_servo(self):
         try:
-            self.servo = serial.Serial(self.servo_port, 9600)
+            self.servo = serial.Serial(self.servo_port, 115200)
             time.sleep(2)
             print("[SERVO] Connected")
             return True
@@ -117,148 +108,83 @@ class BasicPIDController:
             print(f"[SERVO] Failed: {e}")
             return False
 
-    def send_servo_angle(self, output):
-        """Send control output to active motor; keep other motors at neutral."""
-        # Get active motor (thread-safe)
-        with self.pid_lock:
-            active_motor = self.active_motor
-        
-        # Reset all angles to neutral
-        self.last_angles = self.servo_neutral_angles.copy()
-        
-        # Apply control output only to the active motor (output is already absolute angle 0-120)
-        self.last_angles[active_motor] = int(np.clip(output, 0, 120))
-        
+    def send_servo_angles(self, outputs):
+        """Send control outputs to all motors."""
+        self.last_angles = [int(np.clip(o, 0, 120)) for o in outputs]
         cmd = f"{self.last_angles[0]} {self.last_angles[1]} {self.last_angles[2]}\n"
         print(cmd)
         try:
-            self.servo.write(cmd.encode())
+            if self.servo:
+                self.servo.write(cmd.encode())
         except Exception as e:
             print(f"[SERVO] Send failed: {e}")
 
     # --- PID ---
-    def update_pid(self, position, dt=0.033):
-        with self.pid_lock:
-            kp = self.Kp
-            ki = self.Ki
-            kd = self.Kd
-            setpoint = self.setpoint
-
-        error = position - setpoint
-        # error *= 100  # scale
-        P = kp * error
-        self.integral += error * dt
-        I = ki * self.integral
-        derivative = (error - self.prev_error) / dt
-        D = kd * derivative
-        self.prev_error = error
-        
-        # Calculate raw PID output
-        pid_output = P + I + D
-        
-        # Get active motor to use motor-specific thresholds
-        with self.pid_lock:
-            active_motor = self.active_motor
-        
-        # Per-motor sensitivity scaling factors (to compensate for different motor sensitivities)
-        # Values < 1.0 reduce sensitivity, > 1.0 increase sensitivity
-        # Motor B is more sensitive, so scale it down
-        motor_sensitivity_scales = [1.0, 1.0, 1.0]  # [Motor A, Motor B, Motor C]
-        sensitivity_scale = motor_sensitivity_scales[active_motor]
-        
-        # Scale PID output based on motor sensitivity
-        pid_output = pid_output * sensitivity_scale
-        
-        # Center output around motor's neutral angle (40 degrees)
-        # This gives us -40 to +80 range from neutral, which maps to 0-120 servo range
-        center_angle = 40.0  # Motor's physical neutral position
-        output = center_angle + pid_output
-        
-        # Apply minimum output threshold to overcome friction/inertia near center
-        # When error is small, PID output is tiny and motor may not move
-        # This ensures minimum movement to overcome static friction
-        # Per-motor thresholds (can be adjusted individually if needed)
-        min_output_thresholds = [5, 0, 5]  # [Motor A, Motor B, Motor C] - Minimum degrees to move from center
-        min_output_threshold = min_output_thresholds[active_motor]
-        
-        # Extra threshold for the side that needs more support (away from motor)
-        # direction = 1: error >= 0 (one side), direction = -1: error < 0 (other side)
-        # Negative error side (direction == -1) struggles more, so needs extra threshold
-        # Per-motor extra thresholds (can be adjusted individually if needed)
-        extra_thresholds_negative_error_side = [10, 10, 10]  # [Motor A, Motor B, Motor C] - Extra degrees for negative error side
-        extra_threshold_negative_error_side = extra_thresholds_negative_error_side[active_motor]
-        if abs(pid_output) < min_output_threshold and abs(error) > 0.0005:
-            # Apply minimum movement in direction of error
-            direction = 1 if pid_output >= 0 else -1
-            if direction == 1:
-                # Ball on positive error side (normal threshold)
-                output = center_angle + min_output_threshold 
+    def update_pid_all(self, positions, dt=0.033):
+        outputs = []
+        # Project setpoint onto each motor axis
+        setpoint = self.setpoint if isinstance(self.setpoint, list) else [0.0, 0.0]
+        for i in range(3):
+            # Calculate setpoint projection for this motor
+            if self.peg_points_3d and len(self.peg_points_3d) == 3:
+                mid_x = self.platform_center[0]
+                mid_y = self.platform_center[1]
+                peg_point = self.peg_points_3d[i]
+                peg_x = peg_point[0]
+                peg_y = peg_point[1]
+                dir_x = peg_x - mid_x
+                dir_y = peg_y - mid_y
+                dir_length = np.sqrt(dir_x**2 + dir_y**2)
+                if dir_length > 0:
+                    dir_x /= dir_length
+                    dir_y /= dir_length
+                    setpoint_proj = setpoint[0] * dir_x + setpoint[1] * dir_y
+                else:
+                    setpoint_proj = setpoint[0]
             else:
-                # Ball on negative error side - add extra support since this side struggles more
-                output = center_angle - min_output_threshold - extra_threshold_negative_error_side
-        
-        # Clip to valid servo range (0-120 degrees)
-        output = np.clip(output, 0, 120)
-        print("P: ", P, "kp: ", kp, "Error: ", error, "PID_out: ", pid_output, "Output: ", output)
-        # print(f"[PID] Error: {error:.3f}, P: {P:.1f}, I: {I:.1f}, D: {D:.1f}, Output: {output:.1f}")
-        return output
+                setpoint_proj = setpoint[0]
+            # Error is position minus setpoint projection
+            error = positions[i] - setpoint_proj
+            P = self.Kp * error
+            self.integral[i] += error * dt
+            I = self.Ki * self.integral[i]
+            derivative = (error - self.prev_error[i]) / dt
+            D = self.Kd * derivative
+            self.prev_error[i] = error
+            pid_output = P + I + D
+            center_angle = 40.0
+            output = center_angle + pid_output
+            output = np.clip(output, 0, 120)
+            outputs.append(output)
+        return outputs
 
-    def calculate_motor_position(self, ball_x_norm, center_x, center_y, frame_width, frame_height, active_motor):
-        """Calculate ball position along the active motor's axis.
-        
-        Projects the ball position onto the line from platform center 
-        to the active motor's peg point.
-        
-        Args:
-            ball_x_norm: Normalized ball x position (0-1)
-            center_x, center_y: Platform center coordinates
-            frame_width, frame_height: Frame dimensions in pixels
-            active_motor: Motor index (0=A, 1=B, 2=C)
-        
-        Returns:
-            position_m: Ball position in meters along the motor's axis
-        """
-        # Convert normalized x to pixel coordinates
-        # Note: detect_ball_x only returns x_norm, so we estimate y at center for now
+    def calculate_motor_positions(self, ball_x_norm, ball_y_norm, center_x, center_y, frame_width, frame_height):
+        """Calculate ball position along each motor's axis."""
         ball_x_pixel = ball_x_norm * frame_width
-        ball_y_pixel = center_y  # Assume ball is at center y (single-axis control)
-        
-        # Get ball offset from center
+        ball_y_pixel = ball_y_norm * frame_height
         dx = ball_x_pixel - center_x
-        dy = ball_y_pixel - center_y  # Will be 0 for now, but kept for future 2D support
-        
-        # If we have peg points, project onto the active motor's axis
-        if self.peg_points_3d and len(self.peg_points_3d) == 3:
-            # Get the active motor's peg point
-            # Frame is resized to calibration size, so no scaling needed
-            peg_point = self.peg_points_3d[active_motor]
-            peg_x = peg_point[0]
-            peg_y = peg_point[1]
-            
-            # Calculate direction vector from center to peg point
-            dir_x = peg_x - center_x
-            dir_y = peg_y - center_y
-            dir_length = np.sqrt(dir_x**2 + dir_y**2)
-            
-            if dir_length > 0:
-                # Normalize direction vector
-                dir_x /= dir_length
-                dir_y /= dir_length
-                
-                # Project ball position onto this direction
-                # Dot product of (dx, dy) with normalized direction vector
-                projection = dx * dir_x + dy * dir_y
+        dy = ball_y_pixel - center_y
+        positions = []
+        for i in range(3):
+            if self.peg_points_3d and len(self.peg_points_3d) == 3:
+                peg_point = self.peg_points_3d[i]
+                peg_x = peg_point[0]
+                peg_y = peg_point[1]
+                dir_x = peg_x - center_x
+                dir_y = peg_y - center_y
+                dir_length = np.sqrt(dir_x**2 + dir_y**2)
+                if dir_length > 0:
+                    dir_x /= dir_length
+                    dir_y /= dir_length
+                    projection = dx * dir_x + dy * dir_y
+                else:
+                    projection = dx
             else:
-                # Fallback: use x-axis projection
                 projection = dx
-        else:
-            # Fallback: use x-axis for all motors
-            projection = dx
-        
-        # Convert to meters
-        position_m = projection * self.scale_factor
-        return position_m
- 
+            position_m = projection * self.scale_factor
+            positions.append(position_m)
+        return positions
+
     # --- Camera Thread ---
     def camera_thread(self):
         cap = cv2.VideoCapture(self.config['camera']['index'])
@@ -286,7 +212,7 @@ class BasicPIDController:
             frame = cv2.resize(frame, (self.config['camera']['frame_width'], 
                                        self.config['camera']['frame_height']))
             
-            found, x_norm, vis_frame = detect_ball_x(frame, self.lower_hsv, self.upper_hsv)
+            found, x_norm, y_norm, vis_frame = detect_ball_xy(frame, self.lower_hsv, self.upper_hsv)
             
             # Use platform center from calibration (centroid of 3 peg points)
             # Frame is now exactly the calibration size, so no scaling needed
@@ -294,18 +220,13 @@ class BasicPIDController:
             mid_y = self.platform_center[1]
             
             if found:
-                # Get active motor (thread-safe)
-                with self.pid_lock:
-                    active_motor = self.active_motor
-                
-                # Calculate ball position along the active motor's axis
-                position_m = self.calculate_motor_position(
-                    x_norm, mid_x, mid_y, frame.shape[1], frame.shape[0], active_motor)
+                positions = self.calculate_motor_positions(
+                    x_norm, y_norm, mid_x, mid_y, frame.shape[1], frame.shape[0])
                 
                 try:
                     if self.position_queue.full():
                         self.position_queue.get_nowait()
-                    self.position_queue.put_nowait(position_m)
+                    self.position_queue.put_nowait(positions)
                 except Exception:
                     pass
             
@@ -338,8 +259,26 @@ class BasicPIDController:
                 setpoint = self.setpoint
                 active_motor = self.active_motor
             if self.scale_factor != 0:
-                # Calculate target position along the active motor's axis
-                target_offset_meters = setpoint
+                # Project setpoint vector onto the active motor's axis
+                if isinstance(setpoint, list):
+                    if self.peg_points_3d and len(self.peg_points_3d) == 3:
+                        peg_point = self.peg_points_3d[active_motor]
+                        peg_x = peg_point[0]
+                        peg_y = peg_point[1]
+                        dir_x = peg_x - mid_x
+                        dir_y = peg_y - mid_y
+                        dir_length = np.sqrt(dir_x**2 + dir_y**2)
+                        if dir_length > 0:
+                            dir_x /= dir_length
+                            dir_y /= dir_length
+                            setpoint_proj = setpoint[0] * dir_x + setpoint[1] * dir_y
+                        else:
+                            setpoint_proj = setpoint[0]
+                    else:
+                        setpoint_proj = setpoint[0]
+                else:
+                    setpoint_proj = setpoint
+                target_offset_meters = setpoint_proj
                 target_offset_pixels = target_offset_meters / self.scale_factor
                 
                 # Project target onto the active motor's axis (same as ball position)
@@ -388,7 +327,7 @@ class BasicPIDController:
                 # Draw a circle around the target
                 cv2.circle(vis_frame, (target_x, target_y), marker_size + 5, (0, 255, 255), 2)
                 # Label the target with setpoint value
-                cv2.putText(vis_frame, f"Target: {setpoint:.3f}m", 
+                cv2.putText(vis_frame, f"Target: x={setpoint[0]:.3f}, y={setpoint[1]:.3f}m", 
                            (target_x + marker_size + 5, target_y - 5),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
             
@@ -408,14 +347,18 @@ class BasicPIDController:
         self.start_time = time.time()
         while self.running:
             try:
-                position = self.position_queue.get(timeout=0.1)
-                control_output = self.update_pid(position)
-                self.send_servo_angle(control_output)
+                positions = self.position_queue.get(timeout=0.1)
+                # Robust check: skip if not a list of 3 valid numbers
+                if (not isinstance(positions, list) or len(positions) != 3 or any(p is None for p in positions)):
+                    print(f"[CONTROL] Skipping invalid positions: {positions}")
+                    continue
+                outputs = self.update_pid_all(positions)
+                self.send_servo_angles(outputs)
                 current_time = time.time() - self.start_time
                 self.time_log.append(current_time)
-                self.position_log.append(position)
-                self.setpoint_log.append(self.setpoint)
-                self.control_log.append(control_output)
+                self.position_log.append(positions)
+                self.setpoint_log.append(self.setpoint.copy())
+                self.control_log.append(outputs)
             except queue.Empty:
                 continue
             except Exception as e:
@@ -426,53 +369,64 @@ class BasicPIDController:
     def create_gui(self):
         self.root = tk.Tk()
         self.root.title("PID Controller")
-        self.root.geometry("520x400")
+        self.root.geometry("520x450")
 
         ttk.Label(self.root, text="PID Gains", font=("Arial", 18, "bold")).pack(pady=10)
 
         # Kp
         ttk.Label(self.root, text="Kp").pack()
         self.kp_var = tk.DoubleVar(value=self.Kp)
-        kp_slider = ttk.Scale(self.root, from_=0, to=100, variable=self.kp_var, orient=tk.HORIZONTAL, length=500)
+        kp_slider = ttk.Scale(self.root, from_=0, to=2, variable=self.kp_var, orient=tk.HORIZONTAL, length=500)
         kp_slider.pack()
-        self.kp_label = ttk.Label(self.root, text=f"Kp: {self.Kp:.1f}")
+        self.kp_label = ttk.Label(self.root, text=f"Kp: {self.Kp:.3f}")
         self.kp_label.pack()
+        self.kp_entry = ttk.Entry(self.root, width=8)
+        self.kp_entry.insert(0, f"{self.Kp:.3f}")
+        self.kp_entry.pack()
+        self.kp_entry.bind("<Return>", lambda e: self.set_gain_from_entry('kp'))
 
         # Ki
         ttk.Label(self.root, text="Ki").pack()
         self.ki_var = tk.DoubleVar(value=self.Ki)
-        ki_slider = ttk.Scale(self.root, from_=0, to=10, variable=self.ki_var, orient=tk.HORIZONTAL, length=500)
+        ki_slider = ttk.Scale(self.root, from_=0, to=2, variable=self.ki_var, orient=tk.HORIZONTAL, length=500)
         ki_slider.pack()
-        self.ki_label = ttk.Label(self.root, text=f"Ki: {self.Ki:.1f}")
+        self.ki_label = ttk.Label(self.root, text=f"Ki: {self.Ki:.3f}")
         self.ki_label.pack()
+        self.ki_entry = ttk.Entry(self.root, width=8)
+        self.ki_entry.insert(0, f"{self.Ki:.3f}")
+        self.ki_entry.pack()
+        self.ki_entry.bind("<Return>", lambda e: self.set_gain_from_entry('ki'))
 
         # Kd
         ttk.Label(self.root, text="Kd").pack()
         self.kd_var = tk.DoubleVar(value=self.Kd)
-        kd_slider = ttk.Scale(self.root, from_=0, to=20, variable=self.kd_var, orient=tk.HORIZONTAL, length=500)
+        kd_slider = ttk.Scale(self.root, from_=0, to=2, variable=self.kd_var, orient=tk.HORIZONTAL, length=500)
         kd_slider.pack()
-        self.kd_label = ttk.Label(self.root, text=f"Kd: {self.Kd:.1f}")
+        self.kd_label = ttk.Label(self.root, text=f"Kd: {self.Kd:.3f}")
         self.kd_label.pack()
+        self.kd_entry = ttk.Entry(self.root, width=8)
+        self.kd_entry.insert(0, f"{self.Kd:.3f}")
+        self.kd_entry.pack()
+        self.kd_entry.bind("<Return>", lambda e: self.set_gain_from_entry('kd'))
 
-        # Setpoint slider
-        ttk.Label(self.root, text="Setpoint (m)").pack()
-        # Use beam length to determine setpoint range (limits were removed from calibration)
+        # Setpoint sliders for X and Y
+        ttk.Label(self.root, text="Setpoint X (m)").pack()
         beam_length = self.config.get('beam_length_m', 0.30)
-        # Check if limits exist in config (for backward compatibility)
         servo_a_config = self.config.get('servo A', {})
         pos_min = servo_a_config.get('position_min_m')
         pos_max = servo_a_config.get('position_max_m')
-        
-        # Use beam length-based defaults if limits not available
         if pos_min is None:
             pos_min = -beam_length / 2
         if pos_max is None:
             pos_max = beam_length / 2
-            
-        self.setpoint_var = tk.DoubleVar(value=self.setpoint)
-        sp_slider = ttk.Scale(self.root, from_=pos_min, to=pos_max, variable=self.setpoint_var, orient=tk.HORIZONTAL, length=500)
-        sp_slider.pack()
-        self.setpoint_label = ttk.Label(self.root, text=f"Setpoint: {self.setpoint:.3f}")
+        self.setpoint_x_var = tk.DoubleVar(value=self.setpoint[0])
+        spx_slider = ttk.Scale(self.root, from_=pos_min, to=pos_max, variable=self.setpoint_x_var, orient=tk.HORIZONTAL, length=500)
+        spx_slider.pack()
+        ttk.Label(self.root, text="Setpoint Y (m)").pack()
+        self.setpoint_y_var = tk.DoubleVar(value=self.setpoint[1])
+        spy_slider = ttk.Scale(self.root, from_=pos_min, to=pos_max, variable=self.setpoint_y_var, orient=tk.HORIZONTAL, length=500)
+        spy_slider.pack()
+        self.setpoint_label = ttk.Label(self.root, text=f"Setpoint: x={self.setpoint[0]:.3f}, y={self.setpoint[1]:.3f}")
         self.setpoint_label.pack()
 
         # Motor selection buttons
@@ -500,6 +454,21 @@ class BasicPIDController:
 
         self.update_gui()
 
+    def set_gain_from_entry(self, gain):
+        """Update gain variable and slider from entry field."""
+        try:
+            if gain == 'kp':
+                val = float(self.kp_entry.get())
+                self.kp_var.set(val)
+            elif gain == 'ki':
+                val = float(self.ki_entry.get())
+                self.ki_var.set(val)
+            elif gain == 'kd':
+                val = float(self.kd_entry.get())
+                self.kd_var.set(val)
+        except Exception:
+            pass
+
     def switch_motor(self):
         """Switch the active motor and reset PID integral."""
         new_motor = self.active_motor_var.get()
@@ -511,7 +480,7 @@ class BasicPIDController:
         
         # Return to neutral position for all motors
         self.last_angles = self.servo_neutral_angles.copy()
-        self.send_servo_angle(0)  # Send neutral position
+        self.send_servo_angles(0)  # Send neutral position
         motor_names = ['A', 'B', 'C']
         self.active_motor_label.config(text=f"Active: Motor {motor_names[new_motor]}")
         print(f"[MOTOR] Switched to Motor {motor_names[new_motor]}")
@@ -519,19 +488,26 @@ class BasicPIDController:
     def update_gui(self):
         if self.running:
             with self.pid_lock:
-                self.Kp = self.kp_var.get()
-                self.Ki = self.ki_var.get()
-                self.Kd = self.kd_var.get()
-                self.setpoint = self.setpoint_var.get()
-                # Update active motor if changed via UI
+                self.Kp = round(self.kp_var.get(), 3)
+                self.Ki = round(self.ki_var.get(), 3)
+                self.Kd = round(self.kd_var.get(), 3)
+                self.setpoint = [self.setpoint_x_var.get(), self.setpoint_y_var.get()]
                 if self.active_motor_var.get() != self.active_motor:
                     self.switch_motor()
-
-            self.kp_label.config(text=f"Kp: {self.Kp:.1f}")
-            self.ki_label.config(text=f"Ki: {self.Ki:.1f}")
-            self.kd_label.config(text=f"Kd: {self.Kd:.1f}")
-            self.setpoint_label.config(text=f"Setpoint: {self.setpoint:.3f}")
-
+            self.kp_label.config(text=f"Kp: {self.Kp:.3f}")
+            self.ki_label.config(text=f"Ki: {self.Ki:.3f}")
+            self.kd_label.config(text=f"Kd: {self.Kd:.3f}")
+            # Only update entry fields if they do not have focus
+            if self.root.focus_get() != self.kp_entry:
+                self.kp_entry.delete(0, tk.END)
+                self.kp_entry.insert(0, f"{self.Kp:.3f}")
+            if self.root.focus_get() != self.ki_entry:
+                self.ki_entry.delete(0, tk.END)
+                self.ki_entry.insert(0, f"{self.Ki:.3f}")
+            if self.root.focus_get() != self.kd_entry:
+                self.kd_entry.delete(0, tk.END)
+                self.kd_entry.insert(0, f"{self.Kd:.3f}")
+            self.setpoint_label.config(text=f"Setpoint: x={self.setpoint[0]:.3f}, y={self.setpoint[1]:.3f}")
             try:
                 vis_frame = self.display_queue.get_nowait()
                 cv2.imshow("Ball Tracking", vis_frame)
@@ -540,7 +516,6 @@ class BasicPIDController:
                     self.stop()
             except queue.Empty:
                 pass
-
             self.root.after(50, self.update_gui)
 
     # --- Plotting ---
