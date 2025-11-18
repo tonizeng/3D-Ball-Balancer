@@ -29,12 +29,12 @@ void moveMotors(int angle1, int angle2, int angle3)
 {
   // Offset for each motor
       angle1+=60;
-      angle2+=80;
+      angle2+=70;
       angle3+=20;
   
       // Constrain angles to valid range
       angle1 = constrain(angle1, 60, 180);
-      angle2 = constrain(angle2, 80, 200);
+      angle2 = constrain(angle2, 70, 190);
       angle3 = constrain(angle3, 20, 140);
 
       if(prevAngle1 != angle1)

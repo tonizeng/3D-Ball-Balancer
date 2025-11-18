@@ -40,9 +40,9 @@ class BasicPIDController:
             self.config = json.load(f)
 
         # PID gains
-        self.Kp = 0.099
-        self.Ki = 0.040
-        self.Kd = 0.200
+        self.Kp = 0.232
+        self.Ki = 0.011
+        self.Kd = 0.100
 
         # Scale factor
         self.scale_factor = self.config['calibration']['pixel_to_meter_ratio'] * self.config['camera']['frame_width']
